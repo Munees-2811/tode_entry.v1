@@ -9,6 +9,7 @@ from ocr_engine import (
     detect_fields,
     preprocess_image,
 )
+from pdf_handler import pdf_to_images, get_pdf_page_count, extract_pdf_text_native
 from data_manager import DataManager
 
 
@@ -29,6 +30,10 @@ class TODEApp:
         self.field_entries = {}
         self.ocr_engine = tk.StringVar(value="tesseract")
         self.scale_factor = 1.0
+        self.pdf_pages = []
+        self.current_page = 0
+        self.is_pdf = False
+        self.pdf_path = None
 
         self._build_menu()
         self._build_toolbar()
@@ -40,7 +45,7 @@ class TODEApp:
         self.root.config(menu=menubar)
 
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open Image...", command=self.load_image, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open Image/PDF...", command=self.load_file, accelerator="Ctrl+O")
         file_menu.add_separator()
         file_menu.add_command(label="Export CSV...", command=self.export_csv)
         file_menu.add_command(label="Export JSON...", command=self.export_json)
@@ -53,15 +58,16 @@ class TODEApp:
         ocr_menu.add_radiobutton(label="EasyOCR", variable=self.ocr_engine, value="easyocr")
         menubar.add_cascade(label="OCR Engine", menu=ocr_menu)
 
-        self.root.bind("<Control-o>", lambda e: self.load_image())
+        self.root.bind("<Control-o>", lambda e: self.load_file())
 
     def _build_toolbar(self):
         toolbar = ttk.Frame(self.root, padding=5)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(toolbar, text="📂 Open Image", command=self.load_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📂 Open File", command=self.load_file).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="🔍 Extract All", command=self.extract_full).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="📋 Detect Fields", command=self.detect_and_fill).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📄 PDF Text", command=self.extract_pdf_native).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
@@ -94,6 +100,15 @@ class TODEApp:
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+
+        # PDF page navigation bar
+        self.page_nav = ttk.Frame(left_frame)
+        self.page_nav.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(self.page_nav, text="◀ Prev", command=self.prev_page).pack(side=tk.LEFT, padx=2)
+        self.page_label_var = tk.StringVar(value="")
+        ttk.Label(self.page_nav, textvariable=self.page_label_var).pack(side=tk.LEFT, padx=10)
+        ttk.Button(self.page_nav, text="Next ▶", command=self.next_page).pack(side=tk.LEFT, padx=2)
+        self.page_nav.pack_forget()
 
         # Right panel
         right_frame = ttk.Frame(main_pane)
@@ -174,10 +189,12 @@ class TODEApp:
         self._create_field_row(name)
         self.new_field_var.set("")
 
-    def load_image(self):
+    def load_file(self):
         path = filedialog.askopenfilename(
-            title="Select Image",
+            title="Select Image or PDF",
             filetypes=[
+                ("All supported", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp *.pdf"),
+                ("PDF files", "*.pdf"),
                 ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp"),
                 ("All files", "*.*"),
             ],
@@ -185,10 +202,81 @@ class TODEApp:
         if not path:
             return
 
+        if path.lower().endswith(".pdf"):
+            self._load_pdf(path)
+        else:
+            self._load_image(path)
+
+    def _load_image(self, path):
+        self.is_pdf = False
+        self.pdf_pages = []
+        self.pdf_path = None
+        self.page_nav.pack_forget()
+
         self.image_path = path
         self.original_image = Image.open(path)
         self._display_image()
         self.status_var.set(f"Loaded: {os.path.basename(path)}")
+
+    def _load_pdf(self, path):
+        self.status_var.set(f"Converting PDF pages...")
+        self.root.update()
+
+        try:
+            self.pdf_pages = pdf_to_images(path)
+        except ImportError as e:
+            messagebox.showerror("Missing Dependency", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("PDF Error", f"Failed to load PDF:\n{e}")
+            return
+
+        if not self.pdf_pages:
+            messagebox.showinfo("Empty PDF", "No pages found in this PDF.")
+            return
+
+        self.is_pdf = True
+        self.pdf_path = path
+        self.current_page = 0
+        self._show_pdf_page(0)
+
+        self.page_nav.pack(fill=tk.X, pady=(3, 0))
+        self.status_var.set(f"Loaded PDF: {os.path.basename(path)} — {len(self.pdf_pages)} pages")
+
+    def _show_pdf_page(self, page_idx):
+        if not self.pdf_pages or page_idx < 0 or page_idx >= len(self.pdf_pages):
+            return
+
+        self.current_page = page_idx
+        page_info = self.pdf_pages[page_idx]
+        self.image_path = page_info["path"]
+        self.original_image = Image.open(page_info["path"])
+        self._display_image()
+        self.page_label_var.set(f"Page {page_idx + 1} / {len(self.pdf_pages)}")
+
+    def prev_page(self):
+        if self.is_pdf and self.current_page > 0:
+            self._show_pdf_page(self.current_page - 1)
+
+    def next_page(self):
+        if self.is_pdf and self.current_page < len(self.pdf_pages) - 1:
+            self._show_pdf_page(self.current_page + 1)
+
+    def extract_pdf_native(self):
+        if not self.is_pdf or not self.pdf_path:
+            messagebox.showinfo("No PDF", "Load a PDF file first to use native text extraction.")
+            return
+
+        self.status_var.set("Extracting native PDF text...")
+        self.root.update()
+
+        text = extract_pdf_text_native(self.pdf_path, page_num=self.current_page)
+        if not text:
+            text = "(No embedded text found — try OCR extraction instead)"
+
+        self.ocr_text.delete("1.0", tk.END)
+        self.ocr_text.insert("1.0", text)
+        self.status_var.set(f"PDF native text — Page {self.current_page + 1} — {len(text)} chars")
 
     def _display_image(self):
         if not self.original_image:
